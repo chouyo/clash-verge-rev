@@ -1,19 +1,16 @@
 use crate::constants::files::DNS_CONFIG;
-use crate::{
-    config::Config,
-    logging,
-    process::AsyncHandler,
-    utils::{dirs, logging::Type},
-};
+use crate::{config::Config, process::AsyncHandler, utils::dirs};
 use anyhow::Error;
+use arc_swap::{ArcSwap, ArcSwapOption};
+use backon::{ConstantBuilder, Retryable as _};
+use clash_verge_logging::{Type, logging};
 use once_cell::sync::OnceCell;
-use parking_lot::Mutex;
-use reqwest_dav::list_cmd::{ListEntity, ListFile};
+use reqwest_dav::list_cmd::{ListEntity, ListFile, ListMultiStatus};
 use smartstring::alias::String;
 use std::{
     collections::HashMap,
     env::{consts::OS, temp_dir},
-    io::Write,
+    io::Write as _,
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -21,13 +18,12 @@ use std::{
 use tokio::{fs, time::timeout};
 use zip::write::SimpleFileOptions;
 
-// 应用版本常量，来自 tauri.conf.json
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const TIMEOUT_UPLOAD: u64 = 300; // 上传超时 5 分钟
-const TIMEOUT_DOWNLOAD: u64 = 300; // 下载超时 5 分钟
-const TIMEOUT_LIST: u64 = 3; // 列表超时 30 秒
-const TIMEOUT_DELETE: u64 = 3; // 删除超时 30 秒
+const TIMEOUT_UPLOAD: u64 = 300;
+const TIMEOUT_DOWNLOAD: u64 = 300;
+const TIMEOUT_LIST: u64 = 30;
+const TIMEOUT_DELETE: u64 = 30;
 
 #[derive(Clone)]
 struct WebDavConfig {
@@ -45,82 +41,75 @@ enum Operation {
 }
 
 impl Operation {
-    fn timeout(&self) -> u64 {
+    const fn timeout(&self) -> u64 {
         match self {
-            Operation::Upload => TIMEOUT_UPLOAD,
-            Operation::Download => TIMEOUT_DOWNLOAD,
-            Operation::List => TIMEOUT_LIST,
-            Operation::Delete => TIMEOUT_DELETE,
+            Self::Upload => TIMEOUT_UPLOAD,
+            Self::Download => TIMEOUT_DOWNLOAD,
+            Self::List => TIMEOUT_LIST,
+            Self::Delete => TIMEOUT_DELETE,
         }
     }
 }
 
 pub struct WebDavClient {
-    config: Arc<Mutex<Option<WebDavConfig>>>,
-    clients: Arc<Mutex<HashMap<Operation, reqwest_dav::Client>>>,
+    config: ArcSwapOption<WebDavConfig>,
+    clients: ArcSwap<HashMap<Operation, reqwest_dav::Client>>,
 }
 
 impl WebDavClient {
-    pub fn global() -> &'static WebDavClient {
+    pub fn global() -> &'static Self {
         static WEBDAV_CLIENT: OnceCell<WebDavClient> = OnceCell::new();
-        WEBDAV_CLIENT.get_or_init(|| WebDavClient {
-            config: Arc::new(Mutex::new(None)),
-            clients: Arc::new(Mutex::new(HashMap::new())),
+        WEBDAV_CLIENT.get_or_init(|| Self {
+            config: ArcSwapOption::new(None),
+            clients: ArcSwap::new(Arc::new(HashMap::new())),
         })
     }
 
     async fn get_client(&self, op: Operation) -> Result<reqwest_dav::Client, Error> {
-        // 先尝试从缓存获取
         {
-            let clients = self.clients.lock();
-            if let Some(client) = clients.get(&op) {
+            let clients_map = self.clients.load();
+            if let Some(client) = clients_map.get(&op) {
                 return Ok(client.clone());
             }
         }
 
-        // 获取或创建配置
         let config = {
-            // 首先检查是否已有配置
-            let existing_config = self.config.lock().as_ref().cloned();
+            let existing_config = self.config.load();
 
-            if let Some(cfg) = existing_config {
-                cfg
+            if let Some(cfg_arc) = existing_config.clone() {
+                (*cfg_arc).clone()
             } else {
-                // 释放锁后获取异步配置
-                let verge = Config::verge().await.latest_ref().clone();
-                if verge.webdav_url.is_none()
-                    || verge.webdav_username.is_none()
-                    || verge.webdav_password.is_none()
-                {
-                    let msg: String = "Unable to create web dav client, please make sure the webdav config is correct".into();
+                let verge = Config::verge().await.data_arc();
+                if verge.webdav_url.is_none() || verge.webdav_username.is_none() || verge.webdav_password.is_none() {
+                    let msg: String =
+                        "Unable to create web dav client, please make sure the webdav config is correct".into();
                     return Err(anyhow::Error::msg(msg));
                 }
 
                 let config = WebDavConfig {
                     url: verge
                         .webdav_url
+                        .clone()
                         .unwrap_or_default()
                         .trim_end_matches('/')
                         .into(),
-                    username: verge.webdav_username.unwrap_or_default(),
-                    password: verge.webdav_password.unwrap_or_default(),
+                    username: verge.webdav_username.clone().unwrap_or_default(),
+                    password: verge.webdav_password.clone().unwrap_or_default(),
                 };
 
-                // 重新获取锁并存储配置
-                *self.config.lock() = Some(config.clone());
+                self.config.store(Some(Arc::new(config.clone())));
                 config
             }
         };
 
-        // 创建新的客户端
         let client = reqwest_dav::ClientBuilder::new()
             .set_agent(
                 reqwest::Client::builder()
+                    .use_rustls_tls()
                     .danger_accept_invalid_certs(true)
                     .timeout(Duration::from_secs(op.timeout()))
                     .user_agent(format!("clash-verge/{APP_VERSION} ({OS} WebDAV-Client)"))
                     .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                        // 允许所有请求类型的重定向，包括PUT
                         if attempt.previous().len() >= 5 {
                             attempt.error("重定向次数过多")
                         } else {
@@ -130,97 +119,92 @@ impl WebDavClient {
                     .build()?,
             )
             .set_host(config.url.into())
-            .set_auth(reqwest_dav::Auth::Basic(
-                config.username.into(),
-                config.password.into(),
-            ))
+            .set_auth(reqwest_dav::Auth::Basic(config.username.into(), config.password.into()))
             .build()?;
 
-        // 尝试检查目录是否存在，如果不存在尝试创建
-        if client
-            .list(dirs::BACKUP_DIR, reqwest_dav::Depth::Number(0))
-            .await
-            .is_err()
-        {
-            match client.mkcol(dirs::BACKUP_DIR).await {
-                Ok(_) => logging!(info, Type::Backup, "Successfully created backup directory"),
-                Err(e) => {
-                    logging!(
-                        warn,
-                        Type::Backup,
-                        "Warning: Failed to create backup directory: {}",
-                        e
-                    );
-                    // 清除缓存，强制下次重新尝试
-                    self.reset();
-                    return Err(anyhow::Error::msg(format!(
-                        "Failed to create backup directory: {}",
-                        e
-                    )));
+        // 直接使用 MKCOL；部分服务器的 depth-0 PROPFIND 会误报解码错误。
+        if let Err(e) = client.mkcol(dirs::BACKUP_DIR).await {
+            let (status_code, message) = match &e {
+                reqwest_dav::Error::Decode(reqwest_dav::DecodeError::Server(server_err)) => {
+                    (Some(server_err.response_code), Some(server_err.message.as_str()))
                 }
+                reqwest_dav::Error::Decode(reqwest_dav::DecodeError::StatusMismatched(status_err)) => {
+                    (Some(status_err.response_code), None)
+                }
+                reqwest_dav::Error::Reqwest(http_err) => (http_err.status().map(|s| s.as_u16()), None),
+                _ => (None, None),
+            };
+
+            // 409 表示父目录不存在，不能按消息启发式处理。
+            if status_code == Some(409) {
+                logging!(
+                    warn,
+                    Type::Backup,
+                    "Backup directory cannot be created because its parent folder does not exist"
+                );
+                self.reset();
+                return Err(anyhow::Error::msg(
+                    "Failed to create backup directory: parent directory does not exist",
+                ));
             }
+
+            // 405 是标准的已存在响应；部分服务器只在消息里说明。
+            let already_exists = status_code == Some(405)
+                || message.is_some_and(|m| {
+                    let m = m.to_ascii_lowercase();
+                    m.contains("already exist") || m.contains("already taken")
+                });
+
+            if already_exists {
+                logging!(info, Type::Backup, "Backup directory already exists");
+            } else {
+                logging!(warn, Type::Backup, "Failed to create backup directory: {}", e);
+                self.reset();
+                return Err(anyhow::Error::msg(format!("Failed to create backup directory: {}", e)));
+            }
+        } else {
+            logging!(info, Type::Backup, "Successfully created backup directory");
         }
 
-        // 缓存客户端
         {
-            let mut clients = self.clients.lock();
-            clients.insert(op, client.clone());
+            self.clients.rcu(|clients_map| {
+                let mut new_map = (**clients_map).clone();
+                new_map.insert(op, client.clone());
+                Arc::new(new_map)
+            });
         }
 
         Ok(client)
     }
 
     pub fn reset(&self) {
-        *self.config.lock() = None;
-        self.clients.lock().clear();
+        self.config.store(None);
+        self.clients.store(Arc::new(HashMap::new()));
     }
 
     pub async fn upload(&self, file_path: PathBuf, file_name: String) -> Result<(), Error> {
         let client = self.get_client(Operation::Upload).await?;
         let webdav_path: String = format!("{}/{}", dirs::BACKUP_DIR, file_name).into();
 
-        // 读取文件并上传，如果失败尝试一次重试
         let file_content = fs::read(&file_path).await?;
 
-        // 添加超时保护
-        let upload_result = timeout(
-            Duration::from_secs(TIMEOUT_UPLOAD),
-            client.put(&webdav_path, file_content.clone()),
-        )
-        .await;
+        let backoff = ConstantBuilder::default()
+            .with_delay(Duration::from_millis(500))
+            .with_max_times(1);
 
-        match upload_result {
-            Err(_) => {
-                logging!(
-                    warn,
-                    Type::Backup,
-                    "Warning: Upload timed out, retrying once"
-                );
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                timeout(
-                    Duration::from_secs(TIMEOUT_UPLOAD),
-                    client.put(&webdav_path, file_content),
-                )
-                .await??;
-                Ok(())
-            }
-
-            Ok(Err(e)) => {
-                logging!(
-                    warn,
-                    Type::Backup,
-                    "Warning: Upload failed, retrying once: {e}"
-                );
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                timeout(
-                    Duration::from_secs(TIMEOUT_UPLOAD),
-                    client.put(&webdav_path, file_content),
-                )
-                .await??;
-                Ok(())
-            }
-            Ok(Ok(_)) => Ok(()),
-        }
+        (|| async {
+            timeout(
+                Duration::from_secs(TIMEOUT_UPLOAD),
+                client.put(&webdav_path, file_content.clone()),
+            )
+            .await??;
+            Ok::<(), Error>(())
+        })
+        .retry(backoff)
+        .notify(|err, dur| {
+            logging!(warn, Type::Backup, "Upload failed: {err}, retrying in {dur:?}");
+        })
+        .await
     }
 
     pub async fn download(&self, filename: String, storage_path: PathBuf) -> Result<(), Error> {
@@ -243,19 +227,29 @@ impl WebDavClient {
         let path = format!("{}/", dirs::BACKUP_DIR);
 
         let fut = async {
-            let files = client
-                .list(path.as_str(), reqwest_dav::Depth::Number(1))
-                .await?;
+            let response = client.list_raw(path.as_str(), reqwest_dav::Depth::Number(1)).await?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(reqwest_dav::Error::Decode(reqwest_dav::DecodeError::StatusMismatched(
+                    reqwest_dav::StatusMismatchedError {
+                        response_code: status.as_u16(),
+                        expected_code: 207,
+                    },
+                )));
+            }
+
+            let xml = response.text().await?;
+            let files = parse_webdav_list(&xml)?;
             let mut final_files = Vec::new();
             for file in files {
                 if let ListEntity::File(file) = file {
                     final_files.push(file);
                 }
             }
-            Ok::<Vec<ListFile>, Error>(final_files)
+            Ok::<Vec<ListFile>, reqwest_dav::Error>(final_files)
         };
 
-        timeout(Duration::from_secs(TIMEOUT_LIST), fut).await?
+        Ok(timeout(Duration::from_secs(TIMEOUT_LIST), fut).await??)
     }
 
     pub async fn delete(&self, file_name: String) -> Result<(), Error> {
@@ -266,6 +260,13 @@ impl WebDavClient {
         timeout(Duration::from_secs(TIMEOUT_DELETE), fut).await??;
         Ok(())
     }
+}
+
+fn parse_webdav_list(xml: &str) -> Result<Vec<ListEntity>, reqwest_dav::Error> {
+    // Some WebDAV servers emit RFC 2822's numeric UTC offset instead of HTTP-date's `GMT`.
+    let normalized_xml = xml.replace(" +0000</", " GMT</");
+    let multi_status: ListMultiStatus = reqwest_dav::re_exports::serde_xml_rs::from_str(&normalized_xml)?;
+    multi_status.responses.into_iter().map(ListEntity::try_from).collect()
 }
 
 pub async fn create_backup() -> Result<(String, PathBuf), Error> {

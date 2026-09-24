@@ -1,89 +1,63 @@
-import { useLocalStorage } from "foxact/use-local-storage";
-import { useEffect, useRef } from "react";
-import { mutate } from "swr";
-import useSWRSubscription from "swr/subscription";
-import { MihomoWebSocket } from "tauri-plugin-mihomo-api";
+import { MihomoWebSocket } from 'tauri-plugin-mihomo-api'
+
+import { useMihomoWsSubscription } from './use-mihomo-ws-subscription'
 
 export interface IMemoryUsageItem {
-  inuse: number;
-  oslimit?: number;
+  inuse: number
+  oslimit?: number
 }
 
-export const useMemoryData = () => {
-  const [date, setDate] = useLocalStorage("mihomo_memory_date", Date.now());
-  const subscriptKey = `getClashMemory-${date}`;
+const FALLBACK_MEMORY_USAGE: IMemoryUsageItem = { inuse: 0 }
+const DUPLICATE_MEMORY_WINDOW_MS = 50
 
-  const ws = useRef<MihomoWebSocket | null>(null);
-  const wsFirstConnection = useRef<boolean>(true);
-  const timeoutRef = useRef<ReturnType<typeof setTimeout>>(null);
+let lastMemorySignature = ''
+let lastMemoryTimestamp = 0
 
-  const response = useSWRSubscription<IMemoryUsageItem, any, string | null>(
-    subscriptKey,
-    (_key, { next }) => {
-      const reconnect = async () => {
-        await ws.current?.close();
-        ws.current = null;
-        timeoutRef.current = setTimeout(async () => await connect(), 500);
-      };
+const shouldSkipDuplicateMemory = (memory: IMemoryUsageItem) => {
+  const now = Date.now()
+  const signature = `${memory.inuse}:${memory.oslimit ?? ''}`
 
-      const connect = () =>
-        MihomoWebSocket.connect_memory()
-          .then((ws_) => {
-            ws.current = ws_;
-            if (timeoutRef.current) clearTimeout(timeoutRef.current);
+  if (
+    signature === lastMemorySignature &&
+    now - lastMemoryTimestamp <= DUPLICATE_MEMORY_WINDOW_MS
+  ) {
+    return true
+  }
 
-            ws_.addListener(async (msg) => {
-              if (msg.type === "Text") {
-                if (msg.data.startsWith("Websocket error")) {
-                  next(msg.data, { inuse: 0 });
-                  await reconnect();
-                } else {
-                  const data = JSON.parse(msg.data) as IMemoryUsageItem;
-                  next(null, data);
-                }
-              }
-            });
-          })
-          .catch((_) => {
-            if (!ws.current) {
-              timeoutRef.current = setTimeout(async () => await connect(), 500);
-            }
-          });
+  lastMemorySignature = signature
+  lastMemoryTimestamp = now
+  return false
+}
 
-      if (
-        wsFirstConnection.current ||
-        (ws.current && !wsFirstConnection.current)
-      ) {
-        wsFirstConnection.current = false;
-        if (ws.current) {
-          ws.current.close();
-          ws.current = null;
+export const useMemoryData = (options?: { enabled?: boolean }) => {
+  const enabled = options?.enabled ?? true
+
+  const { response, refresh } = useMihomoWsSubscription<IMemoryUsageItem>({
+    storageKey: 'mihomo_memory_date',
+    buildSubscriptKey: (date) => (enabled ? `getClashMemory-${date}` : null),
+    fallbackData: FALLBACK_MEMORY_USAGE,
+    connect: () => MihomoWebSocket.connect_memory(),
+    throttleMs: 500,
+    setupHandlers: ({ next, scheduleReconnect }) => ({
+      handleMessage: (data) => {
+        if (data.startsWith('Websocket error')) {
+          next(data, FALLBACK_MEMORY_USAGE)
+          void scheduleReconnect()
+          return
         }
-        connect();
-      }
 
-      return () => {
-        if (timeoutRef.current) {
-          clearTimeout(timeoutRef.current);
-          timeoutRef.current = null;
+        try {
+          const parsed = JSON.parse(data) as IMemoryUsageItem
+          if (shouldSkipDuplicateMemory(parsed)) {
+            return
+          }
+          next(null, parsed)
+        } catch (error) {
+          next(error, FALLBACK_MEMORY_USAGE)
         }
-        ws.current?.close();
-        ws.current = null;
-      };
-    },
-    {
-      fallbackData: { inuse: 0 },
-      keepPreviousData: true,
-    },
-  );
+      },
+    }),
+  })
 
-  useEffect(() => {
-    mutate(`$sub$${subscriptKey}`);
-  }, [date, subscriptKey]);
-
-  const refreshGetClashMemory = () => {
-    setDate(Date.now());
-  };
-
-  return { response, refreshGetClashMemory };
-};
+  return { response, refreshGetClashMemory: refresh }
+}

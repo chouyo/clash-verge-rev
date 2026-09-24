@@ -15,7 +15,9 @@ A Clash Meta GUI built with <a href="https://github.com/tauri-apps/tauri">Tauri<
   <a href="./README_en.md">English</a> ·
   <a href="./README_es.md">Español</a> ·
   <a href="./README_ru.md">Русский</a> ·
-  <a href="./README_ja.md">日本語</a>
+  <a href="./README_ja.md">日本語</a> ·
+  <a href="./README_ko.md">한국어</a> ·
+  <a href="./README_fa.md">فارسی</a>
 </p>
 
 ## Preview
@@ -41,38 +43,42 @@ We provide packages for Windows (x64/x86), Linux (x64/arm64), and macOS 10.15+ (
 
 Read the [project documentation](https://clash-verge-rev.github.io/) for install steps, troubleshooting, and frequently asked questions.
 
----
-
 ### Telegram Channel
 
 Join [@clash_verge_rev](https://t.me/clash_verge_re) for update announcements.
 
+---
+
 ## Promotion
 
-#### [Doggygo VPN — Performance-oriented global accelerator](https://verge.dginv.click/#/register?code=oaxsAGo6)
+### ✈️ [Doggygo VPN — A Technical-Grade Proxy Service](https://verge.dginv.click/#/register?code=oaxsAGo6)
 
-- High-performance overseas network service with free trials, discounted plans, streaming unlocks, and first-class Hysteria protocol support.
-- Register through the exclusive Clash Verge link to get a 3-day trial with 1 GB of traffic per day: [Sign up](https://verge.dginv.click/#/register?code=oaxsAGo6)
-- Exclusive 20% off coupon for Clash Verge users: `verge20` (limited to 500 uses)
-- Discounted bundle from ¥15.8 per month for 160 GB, plus an additional 20% off for yearly billing
-- Operated by an overseas team with reliable service and up to 50% revenue share
-- Load-balanced clusters with high-speed dedicated routes (compatible with legacy clients), exceptionally low latency, smooth 4K playback
-- First global provider to support the `Hysteria2` protocol—perfect fit for the Clash Verge client
-- Supports streaming services and ChatGPT access
-- Official site: [https://狗狗加速.com](https://verge.dginv.click/#/register?code=oaxsAGo6)
+🚀 A high-performance, overseas, technical-grade proxy service offering free trials and discounted plans, fully unlocking streaming platforms and AI services. The world’s first provider to adopt the **QUIC protocol**.
 
-#### Build Infrastructure Sponsor — [YXVM Dedicated Servers](https://yxvm.com/aff.php?aff=827)
+🎁 Register via the **Clash Verge exclusive invitation link** to receive **3 days of free trial**, with **1GB traffic per day**: 👉 [Register here](https://verge.dginv.click/#/register?code=oaxsAGo6)
 
-Our builds and releases run on YXVM dedicated servers that deliver premium resources, strong performance, and high-speed networking. If downloads feel fast and usage feels snappy, it is thanks to robust hardware.
+#### **Core Advantages:**
 
-🧩 Highlights of YXVM Dedicated Servers:
+- 📱 Self-developed iOS client (the industry’s “only one”), with technology proven in production and **significant ongoing R&D investment**
+- 🧑‍💻 **12-hour live customer support** (also assists with Clash Verge usage issues)
+- 💰 Discounted plans at **only CNY 21 per month, 160GB traffic, 20% off with annual billing**
+- 🌍 Overseas team, no risk of shutdown or exit scams, with up to **50% referral commission**
+- ⚙️ **Cluster-based load balancing** architecture with **real-time load monitoring and elastic scaling**, high-speed dedicated lines (compatible with legacy clients), ultra-low latency, unaffected by peak hours, **4K streaming loads instantly**
+- ⚡ The world’s first **QUIC-protocol-based proxy service**, now featuring faster **QUIC-family protocols** (best paired with the Clash Verge client)
+- 🎬 Unlocks **streaming platforms and mainstream AI services**
 
-- 🌎 Optimized global routes for dramatically faster downloads
-- 🔧 Bare-metal resources instead of shared VPS capacity for maximum performance
-- 🧠 Great for proxy workloads, hosting web/CDN services, CI/CD pipelines, or any high-load tasks
-- 💡 Ready to use instantly with multiple datacenter options, including CN2 and IEPL
-- 📦 The configuration used by this project is on sale—feel free to get the same setup
-- 🎯 Want the same build environment? [Order a YXVM server today](https://yxvm.com/aff.php?aff=827)
+🌐 Official Website: 👉 [https://狗狗加速.com](https://verge.dginv.click/#/register?code=oaxsAGo6)
+
+### 🤖 [GPTKefu — AI-Powered Customer Service Platform Deeply Integrated with Crisp](https://gptkefu.com)
+
+- 🧠 Deep understanding of full conversation context + image recognition, automatically providing professional and precise replies — no more robotic responses.
+- ♾️ **Unlimited replies**, no quota anxiety — unlike other AI customer service products that charge per message.
+- 💬 Pre-sales inquiries, after-sales support, complex Q&A — covers all scenarios effortlessly, with real user cases to prove it.
+- ⚡ 3-minute setup, zero learning curve — instantly boost customer service efficiency and satisfaction.
+- 🎁 Free 14-day trial of the Premium plan — try before you pay: 👉 [Start Free Trial](https://gptkefu.com)
+- 📢 AI Customer Service TG Channel: [@crisp_ai](https://t.me/crisp_ai)
+
+---
 
 ## Features
 
@@ -118,6 +124,11 @@ Clash Verge Rev builds on or draws inspiration from these projects:
 - [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo): A rule-based tunnel written in Go.
 - [Fndroid/clash_for_windows_pkg](https://github.com/Fndroid/clash_for_windows_pkg): A Clash GUI for Windows and macOS.
 - [vitejs/vite](https://github.com/vitejs/vite): Next-generation frontend tooling with blazing-fast DX.
+
+## Privacy
+
+Clash Verge Rev does not collect any user data; configuration and logs stay on
+your own device. See the [Privacy Policy](../PRIVACY.md) for details.
 
 ## License
 

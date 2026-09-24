@@ -1,16 +1,24 @@
-pub mod async_proxy_query;
+pub mod autostart;
 pub mod backup;
-pub mod event_driven_proxy;
 pub mod handle;
 pub mod hotkey;
+pub mod listener;
 pub mod logger;
 pub mod manager;
-mod notification;
+#[cfg(target_os = "macos")]
+pub mod network_watch;
+pub mod notification;
+pub(crate) mod owner_identity;
+pub mod proxy_control;
+pub mod proxy_view;
+pub mod runstate;
+pub(crate) mod runtime_bundle;
 pub mod service;
 pub mod sysopt;
 pub mod timer;
 pub mod tray;
+pub mod updater;
 pub mod validate;
 pub mod win_uwp;
 
-pub use self::{event_driven_proxy::EventDrivenProxyManager, manager::CoreManager, timer::Timer};
+pub use self::{manager::CoreManager, timer::Timer, updater::SilentUpdater};

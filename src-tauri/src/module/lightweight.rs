@@ -1,21 +1,18 @@
 use crate::{
     config::Config,
-    core::{handle, timer::Timer},
-    log_err, logging,
+    core::{timer::Timer, tray::Tray},
     process::AsyncHandler,
-    utils::logging::Type,
 };
 
-#[cfg(target_os = "macos")]
-use crate::logging_error;
+use clash_verge_logging::{Type, logging};
 
 use crate::utils::window_manager::WindowManager;
-use anyhow::{Context, Result};
-use delay_timer::prelude::TaskBuilder;
+use anyhow::Result;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
-use tauri::Listener;
-
-const LIGHT_WEIGHT_TASK_UID: &str = "light_weight_task";
+use tauri::Listener as _;
+use tokio::sync::oneshot;
+use tokio::time::{Duration, sleep};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,15 +25,15 @@ enum LightweightState {
 impl From<u8> for LightweightState {
     fn from(v: u8) -> Self {
         match v {
-            1 => LightweightState::In,
-            2 => LightweightState::Exiting,
-            _ => LightweightState::Normal,
+            1 => Self::In,
+            2 => Self::Exiting,
+            _ => Self::Normal,
         }
     }
 }
 
 impl LightweightState {
-    fn as_u8(self) -> u8 {
+    const fn as_u8(self) -> u8 {
         self as u8
     }
 }
@@ -46,6 +43,8 @@ static LIGHTWEIGHT_STATE: AtomicU8 = AtomicU8::new(LightweightState::Normal as u
 static WINDOW_CLOSE_HANDLER_ID: AtomicU32 = AtomicU32::new(0);
 static WEBVIEW_FOCUS_HANDLER_ID: AtomicU32 = AtomicU32::new(0);
 
+static CANCEL_TX: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
+
 #[inline]
 fn get_state() -> LightweightState {
     LIGHTWEIGHT_STATE.load(Ordering::Acquire).into()
@@ -54,12 +53,7 @@ fn get_state() -> LightweightState {
 #[inline]
 fn try_transition(from: LightweightState, to: LightweightState) -> bool {
     LIGHTWEIGHT_STATE
-        .compare_exchange(
-            from.as_u8(),
-            to.as_u8(),
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        )
+        .compare_exchange(from.as_u8(), to.as_u8(), Ordering::AcqRel, Ordering::Relaxed)
         .is_ok()
 }
 
@@ -78,35 +72,22 @@ pub fn is_in_lightweight_mode() -> bool {
     get_state() == LightweightState::In
 }
 
+async fn refresh_lightweight_tray_state() {
+    if let Err(err) = Tray::global().update_menu().await {
+        logging!(warn, Type::Lightweight, "更新托盘轻量模式状态失败: {err}");
+    }
+}
+
 pub async fn auto_lightweight_boot() -> Result<()> {
     let verge_config = Config::verge().await;
-    let enable_auto = verge_config
-        .data_mut()
-        .enable_auto_light_weight_mode
-        .unwrap_or(false);
-    let is_silent_start = verge_config
-        .latest_ref()
-        .enable_silent_start
-        .unwrap_or(false);
-
+    let is_enable_auto = verge_config.data_arc().enable_auto_light_weight_mode.unwrap_or(false);
+    let is_silent_start = verge_config.data_arc().enable_silent_start.unwrap_or(false);
+    if is_enable_auto {
+        enable_auto_light_weight_mode().await;
+    }
     if is_silent_start {
-        logging!(info, Type::Lightweight, "静默启动：直接进入轻量模式");
-        let _ = entry_lightweight_mode().await;
-        return Ok(());
+        entry_lightweight_mode().await;
     }
-
-    if !enable_auto {
-        logging!(info, Type::Lightweight, "未开启自动轻量模式，跳过初始化");
-        return Ok(());
-    }
-
-    logging!(
-        info,
-        Type::Lightweight,
-        "非静默启动：注册自动轻量模式监听器"
-    );
-    enable_auto_light_weight_mode().await;
-
     Ok(())
 }
 
@@ -122,58 +103,66 @@ pub async fn enable_auto_light_weight_mode() {
 
 pub fn disable_auto_light_weight_mode() {
     logging!(info, Type::Lightweight, "关闭自动轻量模式");
-    let _ = cancel_light_weight_timer();
+    cancel_light_weight_timer();
     cancel_window_close_listener();
     cancel_webview_focus_listener();
 }
 
 pub async fn entry_lightweight_mode() -> bool {
     if !try_transition(LightweightState::Normal, LightweightState::In) {
-        logging!(info, Type::Lightweight, "无需进入轻量模式，跳过调用");
+        logging!(debug, Type::Lightweight, "无需进入轻量模式，跳过调用");
+        refresh_lightweight_tray_state().await;
         return false;
     }
     record_state_and_log(LightweightState::In);
     WindowManager::destroy_main_window();
-    let _ = cancel_light_weight_timer();
+    cancel_light_weight_timer();
+    refresh_lightweight_tray_state().await;
     true
 }
 
 pub async fn exit_lightweight_mode() -> bool {
     if !try_transition(LightweightState::In, LightweightState::Exiting) {
         logging!(
-            info,
+            debug,
             Type::Lightweight,
             "轻量模式不在退出条件（可能已退出或正在退出），跳过调用"
         );
+        refresh_lightweight_tray_state().await;
         return false;
     }
     record_state_and_log(LightweightState::Exiting);
     WindowManager::show_main_window().await;
-    let _ = cancel_light_weight_timer();
+    let enable_auto_light_weight_mode = Config::verge()
+        .await
+        .data_arc()
+        .enable_auto_light_weight_mode
+        .unwrap_or(false);
+    if enable_auto_light_weight_mode {
+        setup_window_close_listener();
+        setup_webview_focus_listener();
+    }
+    cancel_light_weight_timer();
     record_state_and_log(LightweightState::Normal);
+    refresh_lightweight_tray_state().await;
     true
 }
 
 #[cfg(target_os = "macos")]
 pub async fn add_light_weight_timer() {
-    logging_error!(Type::Lightweight, setup_light_weight_timer().await);
+    setup_light_weight_timer().await;
 }
 
 fn setup_window_close_listener() {
-    if let Some(window) = handle::Handle::get_window() {
-        let old_id = WINDOW_CLOSE_HANDLER_ID.swap(0, Ordering::AcqRel);
-        if old_id != 0 {
-            window.unlisten(old_id);
+    if let Some(window) = WindowManager::get_main_window() {
+        let previous_handler_id = WINDOW_CLOSE_HANDLER_ID.swap(0, Ordering::AcqRel);
+        if previous_handler_id != 0 {
+            window.unlisten(previous_handler_id);
+            logging!(debug, Type::Lightweight, "覆盖旧的窗口关闭监听");
         }
         let handler_id = window.listen("tauri://close-requested", move |_event| {
             std::mem::drop(AsyncHandler::spawn(|| async {
-                if let Err(e) = setup_light_weight_timer().await {
-                    logging!(
-                        warn,
-                        Type::Lightweight,
-                        "Warning: Failed to setup light weight timer: {e}"
-                    );
-                }
+                setup_light_weight_timer().await;
             }));
             logging!(info, Type::Lightweight, "监听到关闭请求，开始轻量模式计时");
         });
@@ -182,115 +171,85 @@ fn setup_window_close_listener() {
 }
 
 fn cancel_window_close_listener() {
-    if let Some(window) = handle::Handle::get_window() {
-        let id = WINDOW_CLOSE_HANDLER_ID.swap(0, Ordering::AcqRel);
-        if id != 0 {
+    let id = WINDOW_CLOSE_HANDLER_ID.swap(0, Ordering::AcqRel);
+    if id != 0 {
+        if let Some(window) = WindowManager::get_main_window() {
             window.unlisten(id);
-            logging!(info, Type::Lightweight, "取消了窗口关闭监听");
         }
+        logging!(debug, Type::Lightweight, "取消了窗口关闭监听");
     }
 }
 
 fn setup_webview_focus_listener() {
-    if let Some(window) = handle::Handle::get_window() {
-        let old_id = WEBVIEW_FOCUS_HANDLER_ID.swap(0, Ordering::AcqRel);
-        if old_id != 0 {
-            window.unlisten(old_id);
+    if let Some(window) = WindowManager::get_main_window() {
+        let previous_handler_id = WEBVIEW_FOCUS_HANDLER_ID.swap(0, Ordering::AcqRel);
+        if previous_handler_id != 0 {
+            window.unlisten(previous_handler_id);
+            logging!(debug, Type::Lightweight, "覆盖旧的窗口焦点监听");
         }
         let handler_id = window.listen("tauri://focus", move |_event| {
-            log_err!(cancel_light_weight_timer());
-            logging!(
-                info,
-                Type::Lightweight,
-                "监听到窗口获得焦点，取消轻量模式计时"
-            );
+            cancel_light_weight_timer();
+            logging!(debug, Type::Lightweight, "监听到窗口获得焦点，取消轻量模式计时");
         });
         WEBVIEW_FOCUS_HANDLER_ID.store(handler_id, Ordering::Release);
     }
 }
 
 fn cancel_webview_focus_listener() {
-    if let Some(window) = handle::Handle::get_window() {
-        let id = WEBVIEW_FOCUS_HANDLER_ID.swap(0, Ordering::AcqRel);
-        if id != 0 {
+    let id = WEBVIEW_FOCUS_HANDLER_ID.swap(0, Ordering::AcqRel);
+    if id != 0 {
+        if let Some(window) = WindowManager::get_main_window() {
             window.unlisten(id);
-            logging!(info, Type::Lightweight, "取消了窗口焦点监听");
         }
+        logging!(debug, Type::Lightweight, "取消了窗口焦点监听");
     }
 }
 
-async fn setup_light_weight_timer() -> Result<()> {
-    if let Err(e) = Timer::global().init().await {
-        return Err(e).context("failed to initialize timer");
+async fn setup_light_weight_timer() {
+    let once_by_minutes = Config::verge().await.data_arc().auto_light_weight_minutes.unwrap_or(10);
+
+    let mut cancel_tx_guard = CANCEL_TX.lock();
+    if cancel_tx_guard.is_some() {
+        logging!(
+            debug,
+            Type::Timer,
+            "Lightweight mode timer already exists, skipping setup"
+        );
+        return;
     }
 
-    let once_by_minutes = Config::verge()
-        .await
-        .latest_ref()
-        .auto_light_weight_minutes
-        .unwrap_or(10);
+    let (tx, rx) = oneshot::channel::<()>();
+    *cancel_tx_guard = Some(tx);
+    drop(cancel_tx_guard);
 
-    {
-        let timer_map = Timer::global().timer_map.read();
-        if timer_map.contains_key(LIGHT_WEIGHT_TASK_UID) {
-            logging!(warn, Type::Timer, "轻量模式计时器已存在，跳过创建");
-            return Ok(());
+    AsyncHandler::spawn(move || async move {
+        tokio::select! {
+            _ = sleep(Duration::from_secs(once_by_minutes.saturating_mul(60))) => {
+                logging!(info, Type::Timer, "Lightweight mode timer expired, entering lightweight mode");
+                {
+                    let mut guard = CANCEL_TX.lock();
+                    *guard = None;
+                }
+                entry_lightweight_mode().await;
+            }
+            _ = rx => {
+                logging!(debug, Type::Timer, "Received cancel signal, stopping lightweight mode timer");
+            }
         }
-    }
-
-    let task_id = {
-        Timer::global()
-            .timer_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    };
-
-    let task = TaskBuilder::default()
-        .set_task_id(task_id)
-        .set_maximum_parallel_runnable_num(1)
-        .set_frequency_once_by_minutes(once_by_minutes)
-        .spawn_async_routine(move || async move {
-            logging!(info, Type::Timer, "计时器到期，开始进入轻量模式");
-            entry_lightweight_mode().await;
-        })
-        .context("failed to create timer task")?;
-
-    {
-        let delay_timer = Timer::global().delay_timer.write();
-        delay_timer
-            .add_task(task)
-            .context("failed to add timer task")?;
-    }
-
-    {
-        let mut timer_map = Timer::global().timer_map.write();
-        let timer_task = crate::core::timer::TimerTask {
-            task_id,
-            interval_minutes: once_by_minutes,
-            last_run: chrono::Local::now().timestamp(),
-        };
-        timer_map.insert(LIGHT_WEIGHT_TASK_UID.into(), timer_task);
-    }
+    });
 
     logging!(
         info,
         Type::Timer,
-        "计时器已设置，{} 分钟后将自动进入轻量模式",
+        "Lightweight mode timer set, entering lightweight mode in {} minutes",
         once_by_minutes
     );
-
-    Ok(())
 }
 
-fn cancel_light_weight_timer() -> Result<()> {
-    let mut timer_map = Timer::global().timer_map.write();
-    let delay_timer = Timer::global().delay_timer.write();
-
-    if let Some(task) = timer_map.remove(LIGHT_WEIGHT_TASK_UID) {
-        delay_timer
-            .remove_task(task.task_id)
-            .context("failed to remove timer task")?;
-        logging!(info, Type::Timer, "计时器已取消");
+fn cancel_light_weight_timer() {
+    let mut cancel_tx_guard = CANCEL_TX.lock();
+    if let Some(tx) = cancel_tx_guard.take() {
+        let _ = tx.send(());
+        logging!(debug, Type::Timer, "Timer cancelled");
     }
-
-    Ok(())
 }

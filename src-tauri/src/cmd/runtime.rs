@@ -1,49 +1,46 @@
 use super::CmdResult;
-use crate::{cmd::StringifyErr, config::*, core::CoreManager, log_err};
-use anyhow::{Context, anyhow};
+use crate::{cmd::StringifyErr as _, config::Config, core::CoreManager, utils::yaml_emitter};
+use anyhow::{Context as _, anyhow};
+use clash_verge_logging::{Type, logging};
 use serde_yaml_ng::Mapping;
 use smartstring::alias::String;
 use std::collections::HashMap;
 
-/// 获取运行时配置
 #[tauri::command]
 pub async fn get_runtime_config() -> CmdResult<Option<Mapping>> {
-    Ok(Config::runtime().await.latest_ref().config.clone())
+    Ok(Config::runtime().await.latest_arc().config.clone())
 }
 
-/// 获取运行时YAML配置
 #[tauri::command]
 pub async fn get_runtime_yaml() -> CmdResult<String> {
     let runtime = Config::runtime().await;
-    let runtime = runtime.latest_ref();
+    let runtime = runtime.latest_arc();
 
     let config = runtime.config.as_ref();
     config
         .ok_or_else(|| anyhow!("failed to parse config to yaml file"))
         .and_then(|config| {
-            serde_yaml_ng::to_string(config)
+            yaml_emitter::to_mihomo_config_string(config)
                 .context("failed to convert config to yaml")
                 .map(|s| s.into())
         })
         .stringify_err()
 }
 
-/// 获取运行时存在的键
-#[tauri::command]
-pub async fn get_runtime_exists() -> CmdResult<Vec<String>> {
-    Ok(Config::runtime().await.latest_ref().exists_keys.clone())
-}
-
-/// 获取运行时日志
 #[tauri::command]
 pub async fn get_runtime_logs() -> CmdResult<HashMap<String, Vec<(String, String)>>> {
-    Ok(Config::runtime().await.latest_ref().chain_logs.clone())
+    Ok(Config::runtime().await.latest_arc().chain_logs.clone())
+}
+
+#[tauri::command]
+pub fn take_discarded_keys_notice() -> Option<String> {
+    crate::enhance::take_discarded_keys_notice()
 }
 
 #[tauri::command]
 pub async fn get_runtime_proxy_chain_config(proxy_chain_exit_node: String) -> CmdResult<String> {
     let runtime = Config::runtime().await;
-    let runtime = runtime.latest_ref();
+    let runtime = runtime.latest_arc();
 
     let config = runtime
         .config
@@ -57,8 +54,7 @@ pub async fn get_runtime_proxy_chain_config(proxy_chain_exit_node: String) -> Cm
 
         while let Some(proxy) = proxies.iter().find(|proxy| {
             if let serde_yaml_ng::Value::Mapping(proxy_map) = proxy {
-                proxy_map.get("name").map(|x| x.as_str()) == proxy_name
-                    && proxy_map.get("dialer-proxy").is_some()
+                proxy_map.get("name").map(|x| x.as_str()) == proxy_name && proxy_map.get("dialer-proxy").is_some()
             } else {
                 false
             }
@@ -72,7 +68,6 @@ pub async fn get_runtime_proxy_chain_config(proxy_chain_exit_node: String) -> Cm
             .find(|proxy| proxy.get("name").map(|x| x.as_str()) == proxy_name)
             && !proxies_chain.is_empty()
         {
-            // 添加第一个节点
             proxies_chain.push(entry_proxy.to_owned());
         }
 
@@ -82,7 +77,7 @@ pub async fn get_runtime_proxy_chain_config(proxy_chain_exit_node: String) -> Cm
 
         config.insert("proxies".into(), proxies_chain);
 
-        serde_yaml_ng::to_string(&config)
+        yaml_emitter::to_mihomo_config_string(&config)
             .context("YAML generation failed")
             .map(|s| s.into())
             .stringify_err()
@@ -91,24 +86,21 @@ pub async fn get_runtime_proxy_chain_config(proxy_chain_exit_node: String) -> Cm
     }
 }
 
-/// 更新运行时链式代理配置
 #[tauri::command]
-pub async fn update_proxy_chain_config_in_runtime(
-    proxy_chain_config: Option<serde_yaml_ng::Value>,
-) -> CmdResult<()> {
-    {
-        let runtime = Config::runtime().await;
-        let mut draft = runtime.draft_mut();
-        draft.update_proxy_chain_config(proxy_chain_config);
-        drop(draft);
-        runtime.apply();
-    }
-
-    // 生成新的运行配置文件并通知 Clash 核心重新加载
-    let run_path = Config::generate_file(ConfigType::Run)
+pub async fn update_proxy_chain_config_in_runtime(proxy_chain_config: Option<serde_yaml_ng::Value>) -> CmdResult<()> {
+    match CoreManager::global()
+        .update_runtime_config(|d| d.update_proxy_chain_config(proxy_chain_config))
         .await
-        .stringify_err()?;
-    log_err!(CoreManager::global().put_configs_force(run_path).await);
+    {
+        Ok(outcome) if outcome.is_valid() => {}
+        Ok(outcome) => logging!(
+            warn,
+            Type::Core,
+            "Failed to apply runtime proxy chain config: {}",
+            outcome
+        ),
+        Err(err) => logging!(error, Type::Core, "Failed to apply runtime proxy chain config: {err:#}"),
+    }
 
     Ok(())
 }

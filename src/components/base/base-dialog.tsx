@@ -1,4 +1,3 @@
-import { LoadingButton } from "@mui/lab";
 import {
   Button,
   Dialog,
@@ -7,28 +6,29 @@ import {
   DialogTitle,
   type SxProps,
   type Theme,
-} from "@mui/material";
-import { ReactNode } from "react";
+} from '@mui/material'
+import { ReactNode } from 'react'
 
 interface Props {
-  title: ReactNode;
-  open: boolean;
-  okBtn?: ReactNode;
-  cancelBtn?: ReactNode;
-  disableOk?: boolean;
-  disableCancel?: boolean;
-  disableFooter?: boolean;
-  contentSx?: SxProps<Theme>;
-  children?: ReactNode;
-  loading?: boolean;
-  onOk?: () => void;
-  onCancel?: () => void;
-  onClose?: () => void;
+  title: ReactNode
+  open: boolean
+  okBtn?: ReactNode
+  cancelBtn?: ReactNode
+  disableEnforceFocus?: boolean
+  disableOk?: boolean
+  disableCancel?: boolean
+  disableFooter?: boolean
+  contentSx?: SxProps<Theme>
+  children?: ReactNode
+  loading?: boolean
+  onOk?: () => void
+  onCancel?: () => void
+  onClose?: () => void
 }
 
 export interface DialogRef {
-  open: () => void;
-  close: () => void;
+  open: () => void
+  close: () => void
 }
 
 export const BaseDialog: React.FC<Props> = ({
@@ -37,6 +37,7 @@ export const BaseDialog: React.FC<Props> = ({
   children,
   okBtn,
   cancelBtn,
+  disableEnforceFocus,
   contentSx,
   disableCancel,
   disableOk,
@@ -47,7 +48,11 @@ export const BaseDialog: React.FC<Props> = ({
   onClose,
 }) => {
   return (
-    <Dialog open={open} onClose={onClose}>
+    <Dialog
+      open={open}
+      onClose={onClose}
+      disableEnforceFocus={disableEnforceFocus}
+    >
       <DialogTitle>{title}</DialogTitle>
 
       <DialogContent sx={contentSx}>{children}</DialogContent>
@@ -60,12 +65,12 @@ export const BaseDialog: React.FC<Props> = ({
             </Button>
           )}
           {!disableOk && (
-            <LoadingButton loading={loading} variant="contained" onClick={onOk}>
+            <Button loading={loading} variant="contained" onClick={onOk}>
               {okBtn}
-            </LoadingButton>
+            </Button>
           )}
         </DialogActions>
       )}
     </Dialog>
-  );
-};
+  )
+}

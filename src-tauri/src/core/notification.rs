@@ -1,224 +1,315 @@
-use crate::{
-    constants::{retry, timing},
-    logging,
-    utils::logging::Type,
-};
-use parking_lot::RwLock;
+use clash_verge_logging::{Type, logging};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use serde_json::json;
 use smartstring::alias::String;
 use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc,
-    },
-    thread,
-    time::Instant,
+    collections::HashMap,
+    future::Future,
+    sync::atomic::{AtomicU64, Ordering},
 };
-use tauri::{Emitter, WebviewWindow};
+use tauri::{AppHandle, Emitter as _, Manager as _, WebviewWindow};
 
-#[derive(Debug, Clone)]
-pub enum FrontendEvent {
+#[derive(Debug)]
+pub enum FrontendEvent<'a> {
     RefreshClash,
     RefreshVerge,
-    NoticeMessage { status: String, message: String },
-    ProfileChanged { current_profile_id: String },
-    TimerUpdated { profile_index: String },
-    ProfileUpdateStarted { uid: String },
-    ProfileUpdateCompleted { uid: String },
+    RefreshProfiles,
+    RefreshProxyConfig,
+    NoticeMessage {
+        status: &'a str,
+        message: String,
+    },
+    ProfileChanged {
+        current_profile_id: &'a String,
+    },
+    TimerUpdated {
+        profile_index: &'a String,
+    },
+    ProfileUpdateStarted {
+        uid: &'a String,
+    },
+    ProfileUpdateCompleted {
+        uid: &'a String,
+    },
+    RunStateChanged {
+        state: serde_json::Value,
+    },
+    PendingFailuresChanged,
+    #[cfg(target_os = "linux")]
+    ThemeChanged {
+        theme: tauri::Theme,
+    },
 }
 
+/// Operation associated with a pending failure.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FailedOperation {
+    SystemProxyEnable,
+    SystemProxyDisable,
+    SystemProxyRestore,
+    SystemProxyGuard,
+}
+
+impl FailedOperation {
+    /// User requests outrank incidental restores under the same code.
+    const fn outranks(self, other: Self) -> bool {
+        matches!(self, Self::SystemProxyEnable | Self::SystemProxyDisable) && matches!(other, Self::SystemProxyRestore)
+    }
+
+    /// Whether a successful apply of `asked` resolves this operation's failure.
+    const fn retired_by_success_of(self, asked: Self) -> bool {
+        match (self, asked) {
+            // Only replacing or stopping the guard resolves its failure.
+            (Self::SystemProxyGuard, _) | (_, Self::SystemProxyGuard) => false,
+            // The user asked and got an answer, so nothing earlier is still owed to them.
+            (_, Self::SystemProxyEnable | Self::SystemProxyDisable) => true,
+            // An incidental restore says nothing about a request they may not have seen fail.
+            (Self::SystemProxyRestore, Self::SystemProxyRestore) => true,
+            (_, Self::SystemProxyRestore) => false,
+        }
+    }
+}
+
+/// Latest unresolved failure for one stable code.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingFailure {
+    /// Stable code used as the table key.
+    pub code: String,
+    /// Full diagnostic context chain.
+    pub detail: String,
+    pub operation: FailedOperation,
+    /// Monotonic identity for repeated failures under the same code.
+    pub sequence: u64,
+}
+
+/// Non-destructive pending state, indexed by stable code.
 #[derive(Debug, Default)]
-struct EventStats {
-    total_sent: AtomicU64,
-    total_errors: AtomicU64,
-    last_error_time: RwLock<Option<Instant>>,
+struct FailureTable {
+    entries: Mutex<HashMap<String, PendingFailure>>,
+    sequence: AtomicU64,
 }
 
-#[derive(Debug, Clone)]
-pub struct ErrorMessage {
-    pub status: String,
-    pub message: String,
+impl FailureTable {
+    fn record(&self, operation: FailedOperation, code: &str, detail: String) {
+        // Sequence assignment and replacement must share one ordering lock.
+        let mut entries = self.entries.lock();
+        // Preserve an unanswered request over a later restore.
+        let operation = entries
+            .get(code)
+            .filter(|existing| existing.operation.outranks(operation))
+            .map_or(operation, |existing| existing.operation);
+        let failure = PendingFailure {
+            code: code.into(),
+            detail,
+            operation,
+            sequence: self.sequence.fetch_add(1, Ordering::AcqRel).wrapping_add(1),
+        };
+        entries.insert(code.into(), failure);
+    }
+
+    fn snapshot(&self) -> Vec<PendingFailure> {
+        let mut failures: Vec<PendingFailure> = self.entries.lock().values().cloned().collect();
+        failures.sort_by_key(|failure| failure.sequence);
+        failures
+    }
+
+    /// Return whether a guard failure was retired.
+    fn retire_guard(&self) -> bool {
+        let mut entries = self.entries.lock();
+        let before = entries.len();
+        entries.retain(|_, failure| failure.operation != FailedOperation::SystemProxyGuard);
+        before != entries.len()
+    }
+
+    /// Return whether any proxy failure was retired.
+    fn retire_system_proxy(&self, asked: FailedOperation) -> bool {
+        let mut entries = self.entries.lock();
+        let before = entries.len();
+        entries.retain(|_, failure| !failure.operation.retired_by_success_of(asked));
+        before != entries.len()
+    }
+}
+
+#[cfg(test)]
+mod failure_table_tests {
+    use super::{FailedOperation, FailureTable};
+
+    #[tokio::test]
+    async fn a_declared_intent_reaches_the_place_the_write_fails() {
+        let asked = super::asking_for(FailedOperation::SystemProxyEnable, async {
+            tokio::task::yield_now().await;
+            super::what_was_asked()
+        })
+        .await;
+
+        assert_eq!(asked, FailedOperation::SystemProxyEnable);
+        assert_eq!(super::what_was_asked(), FailedOperation::SystemProxyRestore);
+    }
+
+    #[test]
+    fn an_incidental_failure_does_not_take_over_a_request_the_user_is_still_owed() {
+        let table = FailureTable::default();
+        table.record(
+            FailedOperation::SystemProxyEnable,
+            "SYSPROXY_PRIVILEGE_REQUIRED",
+            "asked for it on".into(),
+        );
+        table.record(
+            FailedOperation::SystemProxyRestore,
+            "SYSPROXY_PRIVILEGE_REQUIRED",
+            "and a restart hit it too".into(),
+        );
+
+        let entries = table.snapshot();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].operation, FailedOperation::SystemProxyEnable);
+        assert_eq!(entries[0].detail, "and a restart hit it too");
+
+        assert!(!table.retire_system_proxy(FailedOperation::SystemProxyRestore));
+        assert!(table.retire_system_proxy(FailedOperation::SystemProxyEnable));
+    }
+
+    #[test]
+    fn a_request_still_replaces_an_incidental_failure() {
+        let table = FailureTable::default();
+        table.record(
+            FailedOperation::SystemProxyRestore,
+            "SYSPROXY_PRIVILEGE_REQUIRED",
+            "a".into(),
+        );
+        table.record(
+            FailedOperation::SystemProxyDisable,
+            "SYSPROXY_PRIVILEGE_REQUIRED",
+            "b".into(),
+        );
+
+        let entries = table.snapshot();
+        assert_eq!(entries[0].operation, FailedOperation::SystemProxyDisable);
+        assert!(table.retire_system_proxy(FailedOperation::SystemProxyDisable));
+    }
+
+    #[test]
+    fn two_incidental_failures_still_replace_each_other() {
+        let table = FailureTable::default();
+        table.record(
+            FailedOperation::SystemProxyRestore,
+            "SYSPROXY_PRIVILEGE_REQUIRED",
+            "first".into(),
+        );
+        table.record(
+            FailedOperation::SystemProxyRestore,
+            "SYSPROXY_PRIVILEGE_REQUIRED",
+            "second".into(),
+        );
+
+        let entries = table.snapshot();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].detail, "second");
+    }
+}
+
+tokio::task_local! {
+    /// User-requested operation inherited by the current task.
+    static ASKING_FOR: FailedOperation;
+}
+
+/// Run `operation` with the user's intent attached to whatever failure it produces.
+pub async fn asking_for<T>(operation: FailedOperation, work: impl Future<Output = T>) -> T {
+    ASKING_FOR.scope(operation, work).await
+}
+
+/// What the caller asked for, or a restore when nobody asked.
+pub fn what_was_asked() -> FailedOperation {
+    ASKING_FOR
+        .try_with(|operation| *operation)
+        .unwrap_or(FailedOperation::SystemProxyRestore)
+}
+
+static PENDING_FAILURES: Lazy<FailureTable> = Lazy::new(FailureTable::default);
+
+pub fn record_failure(operation: FailedOperation, code: &str, detail: impl Into<String>) {
+    PENDING_FAILURES.record(operation, code, detail.into());
+    notify_pending_failures_changed();
+}
+
+pub fn has_pending_failure(code: &str) -> bool {
+    PENDING_FAILURES.entries.lock().contains_key(code)
+}
+
+/// Return unresolved failures oldest first without clearing them.
+pub fn pending_failures() -> Vec<PendingFailure> {
+    PENDING_FAILURES.snapshot()
+}
+
+/// Retire guard failures after replacement or shutdown.
+pub fn retire_guard_failures() {
+    if PENDING_FAILURES.retire_guard() {
+        notify_pending_failures_changed();
+    }
+}
+
+/// Retire failures resolved by a successful apply of what was asked.
+pub fn retire_system_proxy_failures(asked: FailedOperation) {
+    if PENDING_FAILURES.retire_system_proxy(asked) {
+        notify_pending_failures_changed();
+    }
+}
+
+/// Nudge the window to reread pending state; the event carries no payload.
+fn notify_pending_failures_changed() {
+    let Some(app_handle) = crate::APP_HANDLE.get() else {
+        return;
+    };
+    NotificationSystem::send_event(app_handle.clone(), FrontendEvent::PendingFailuresChanged);
 }
 
 #[derive(Debug)]
-pub struct NotificationSystem {
-    sender: Option<mpsc::Sender<FrontendEvent>>,
-    #[allow(clippy::type_complexity)]
-    worker_handle: Option<thread::JoinHandle<()>>,
-    pub(super) is_running: bool,
-    stats: EventStats,
-    emergency_mode: RwLock<bool>,
-}
-
-impl Default for NotificationSystem {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub struct NotificationSystem {}
 
 impl NotificationSystem {
-    pub fn new() -> Self {
-        Self {
-            sender: None,
-            worker_handle: None,
-            is_running: false,
-            stats: EventStats::default(),
-            emergency_mode: RwLock::new(false),
+    fn emit_to_window(window: &WebviewWindow, event_name: &'static str, payload: serde_json::Value) {
+        if let Err(e) = window.emit(event_name, payload) {
+            logging!(warn, Type::Frontend, "Event emit failed: {}", e);
         }
     }
 
-    pub fn start(&mut self) {
-        if self.is_running {
-            return;
-        }
-
-        let (tx, rx) = mpsc::channel();
-        self.sender = Some(tx);
-        self.is_running = true;
-
-        let result = thread::Builder::new()
-            .name("frontend-notifier".into())
-            .spawn(move || Self::worker_loop(rx));
-
-        match result {
-            Ok(handle) => self.worker_handle = Some(handle),
-            Err(e) => logging!(
-                error,
-                Type::System,
-                "Failed to start notification worker: {}",
-                e
-            ),
-        }
-    }
-
-    fn worker_loop(rx: mpsc::Receiver<FrontendEvent>) {
-        use super::handle::Handle;
-
-        let handle = Handle::global();
-
-        while !handle.is_exiting() {
-            match rx.recv() {
-                Ok(event) => Self::process_event(handle, event),
-                Err(e) => {
-                    logging!(
-                        error,
-                        Type::System,
-                        "receive event error, stop notification worker: {}",
-                        e
-                    );
-                    break;
-                }
-            }
-        }
-    }
-
-    fn process_event(handle: &super::handle::Handle, event: FrontendEvent) {
-        let system_guard = handle.notification_system.read();
-        let Some(system) = system_guard.as_ref() else {
-            return;
-        };
-
-        if system.should_skip_event(&event) {
-            return;
-        }
-
-        if let Some(window) = super::handle::Handle::get_window() {
-            system.emit_to_window(&window, event);
-            thread::sleep(timing::EVENT_EMIT_DELAY);
-        }
-    }
-
-    fn should_skip_event(&self, event: &FrontendEvent) -> bool {
-        let is_emergency = *self.emergency_mode.read();
-        matches!(
-            (is_emergency, event),
-            (true, FrontendEvent::NoticeMessage { status, .. }) if status == "info"
-        )
-    }
-
-    fn emit_to_window(&self, window: &WebviewWindow, event: FrontendEvent) {
-        let (event_name, payload) = self.serialize_event(event);
-
-        let Ok(payload) = payload else {
-            self.stats.total_errors.fetch_add(1, Ordering::Relaxed);
-            return;
-        };
-
-        match window.emit(event_name, payload) {
-            Ok(_) => {
-                self.stats.total_sent.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => {
-                logging!(warn, Type::Frontend, "Event emit failed: {}", e);
-                self.handle_emit_error();
-            }
-        }
-    }
-
-    fn serialize_event(
-        &self,
-        event: FrontendEvent,
-    ) -> (&'static str, Result<serde_json::Value, serde_json::Error>) {
-        use serde_json::json;
-
+    fn serialize_event(event: FrontendEvent) -> (&'static str, Result<serde_json::Value, serde_json::Error>) {
         match event {
             FrontendEvent::RefreshClash => ("verge://refresh-clash-config", Ok(json!("yes"))),
             FrontendEvent::RefreshVerge => ("verge://refresh-verge-config", Ok(json!("yes"))),
-            FrontendEvent::NoticeMessage { status, message } => (
-                "verge://notice-message",
-                serde_json::to_value((status, message)),
-            ),
-            FrontendEvent::ProfileChanged { current_profile_id } => {
-                ("profile-changed", Ok(json!(current_profile_id)))
+            FrontendEvent::RefreshProfiles => ("verge://refresh-profiles", Ok(json!("yes"))),
+            FrontendEvent::RefreshProxyConfig => ("verge://refresh-proxy-config", Ok(serde_json::Value::Null)),
+            FrontendEvent::NoticeMessage { status, message } => {
+                ("verge://notice-message", serde_json::to_value((status, message)))
             }
-            FrontendEvent::TimerUpdated { profile_index } => {
-                ("verge://timer-updated", Ok(json!(profile_index)))
-            }
-            FrontendEvent::ProfileUpdateStarted { uid } => {
-                ("profile-update-started", Ok(json!({ "uid": uid })))
-            }
-            FrontendEvent::ProfileUpdateCompleted { uid } => {
-                ("profile-update-completed", Ok(json!({ "uid": uid })))
-            }
+            FrontendEvent::ProfileChanged { current_profile_id } => ("profile-changed", Ok(json!(current_profile_id))),
+            FrontendEvent::TimerUpdated { profile_index } => ("verge://timer-updated", Ok(json!(profile_index))),
+            FrontendEvent::ProfileUpdateStarted { uid } => ("profile-update-started", Ok(json!({ "uid": uid }))),
+            FrontendEvent::ProfileUpdateCompleted { uid } => ("profile-update-completed", Ok(json!({ "uid": uid }))),
+            FrontendEvent::RunStateChanged { state } => ("verge://run-state-changed", Ok(state)),
+            FrontendEvent::PendingFailuresChanged => ("verge://pending-failures-changed", Ok(serde_json::Value::Null)),
+            #[cfg(target_os = "linux")]
+            FrontendEvent::ThemeChanged { theme } => ("tauri://theme-changed", serde_json::to_value(theme)),
         }
     }
 
-    fn handle_emit_error(&self) {
-        self.stats.total_errors.fetch_add(1, Ordering::Relaxed);
-        *self.stats.last_error_time.write() = Some(Instant::now());
-
-        let errors = self.stats.total_errors.load(Ordering::Relaxed);
-        if errors > retry::EVENT_EMIT_THRESHOLD && !*self.emergency_mode.read() {
-            logging!(
-                warn,
-                Type::Frontend,
-                "Entering emergency mode after {} errors",
-                errors
-            );
-            *self.emergency_mode.write() = true;
-        }
-    }
-
-    pub fn send_event(&self, event: FrontendEvent) -> bool {
-        if self.should_skip_event(&event) {
-            return false;
-        }
-
-        if let Some(sender) = &self.sender {
-            sender.send(event).is_ok()
-        } else {
-            false
-        }
-    }
-
-    pub fn shutdown(&mut self) {
-        self.is_running = false;
-
-        if let Some(sender) = self.sender.take() {
-            drop(sender);
-        }
-
-        if let Some(handle) = self.worker_handle.take() {
-            let _ = handle.join();
+    pub(crate) fn send_event(app_handle: AppHandle, event: FrontendEvent) {
+        let (event_name, Ok(payload)) = Self::serialize_event(event) else {
+            return;
+        };
+        let dispatch_handle = app_handle.clone();
+        // Emitting from a runtime worker can deadlock on macOS when WebKit's protocol handler
+        // waits for Tauri's webview lock while emit waits synchronously for the main thread.
+        if let Err(err) = app_handle.run_on_main_thread(move || {
+            if let Some(window) = dispatch_handle.get_webview_window("main") {
+                Self::emit_to_window(&window, event_name, payload);
+            }
+        }) {
+            logging!(warn, Type::Frontend, "Failed to dispatch event on main thread: {err}");
         }
     }
 }
